@@ -472,15 +472,44 @@ class Checker:
             points_str, points_num = api.get_points(cookie)
             result.points_total = points_str
 
-            # 4. 执行兑换
-            required_points = self.config.EXCHANGE_PLANS.get(self.config.exchange_plan, 500)
-            self._log(
-                cookie_idx,
-                domain,
-                LogEmoji.EXCHANGE,
-                f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
+            # 4. 执行兑换（自适应：优先用配置档位，积分不够时自动降到当前能兑的最高档）
+            preferred_plan = self.config.exchange_plan
+            required_points = self.config.EXCHANGE_PLANS.get(preferred_plan, 500)
+
+            # 候选档位按「所需积分」从高到低排，挑第一个积分够用的
+            candidates = sorted(
+                self.config.EXCHANGE_PLANS.items(), key=lambda kv: kv[1], reverse=True
             )
-            result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+            chosen_plan, chosen_points = None, 0
+            for plan_name, plan_points in candidates:
+                if points_num >= plan_points:
+                    chosen_plan, chosen_points = plan_name, plan_points
+                    break
+
+            if chosen_plan is None:
+                cheapest = min(self.config.EXCHANGE_PLANS.values())
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.EXCHANGE,
+                    f"积分不足（{points_num}/{cheapest}），本次跳过兑换",
+                )
+                result.exchange = f"积分不足（{points_num} 分，最低需 {cheapest} 分）"
+            else:
+                if chosen_plan != preferred_plan:
+                    self._log(
+                        cookie_idx,
+                        domain,
+                        LogEmoji.EXCHANGE,
+                        f"积分 {points_num} 不够 {preferred_plan}，自动降级为 {chosen_plan}",
+                    )
+                self._log(
+                    cookie_idx,
+                    domain,
+                    LogEmoji.EXCHANGE,
+                    f"开始兑换 {chosen_plan} (需要 {chosen_points} 积分)",
+                )
+                result.exchange = api.exchange(cookie, chosen_plan, chosen_points)
 
         return result
 
