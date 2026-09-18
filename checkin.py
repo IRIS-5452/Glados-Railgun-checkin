@@ -1,5 +1,6 @@
 import requests
 import json
+import re
 import urllib.request
 import os
 import logging
@@ -484,10 +485,9 @@ class Checker:
             #   依据：29 天实测数据模拟 —— 直接上 plan500 会在第 19 天断签
             #   （攒 500 分要 62.5 天，而只剩 19 天），两阶段策略平均存活 74-129 天。
             days_left = 0
-            try:
-                days_left = int(float(result.days)) if result.days not in (None, "None") else 0
-            except (TypeError, ValueError):
-                days_left = 0
+            m = re.search(r"[0-9]+", str(result.days or ""))
+            if m:
+                days_left = int(m.group())
 
             STAGE2_DAYS = 70      # 剩余天数超过这个值，才进入收割期
             STAGE2_POINTS = 500   # 收割期需要的积分门槛
