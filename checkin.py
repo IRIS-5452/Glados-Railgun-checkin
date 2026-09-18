@@ -1,5 +1,6 @@
 import requests
 import json
+import urllib.request
 import os
 import logging
 from enum import Enum
@@ -472,46 +473,120 @@ class Checker:
             points_str, points_num = api.get_points(cookie)
             result.points_total = points_str
 
-            # 4. 执行兑换（自适应：优先用配置档位，积分不够时自动降到当前能兑的最高档）
-            preferred_plan = self.config.exchange_plan
-            required_points = self.config.EXCHANGE_PLANS.get(preferred_plan, 500)
+            # 4. 执行兑换 —— 两阶段策略
+            #
+            #   阶段一（保命期）：剩余天数不够时，只兑 plan100 滚动续期。
+            #     虽然 plan100 汇率最差（0.1 天/分），但门槛低（12.5 天即可兑一次），
+            #     是唯一能让天数滚起来的档位。
+            #   阶段二（收割期）：剩余天数 > 70 且积分 >= 500 时，改兑 plan500，
+            #     吃 0.2 天/分的最高汇率。
+            #
+            #   依据：29 天实测数据模拟 —— 直接上 plan500 会在第 19 天断签
+            #   （攒 500 分要 62.5 天，而只剩 19 天），两阶段策略平均存活 74-129 天。
+            days_left = 0
+            try:
+                days_left = int(float(result.days)) if result.days not in (None, "None") else 0
+            except (TypeError, ValueError):
+                days_left = 0
 
-            # 候选档位按「所需积分」从高到低排，挑第一个积分够用的
-            candidates = sorted(
-                self.config.EXCHANGE_PLANS.items(), key=lambda kv: kv[1], reverse=True
-            )
+            STAGE2_DAYS = 70      # 剩余天数超过这个值，才进入收割期
+            STAGE2_POINTS = 500   # 收割期需要的积分门槛
+
             chosen_plan, chosen_points = None, 0
-            for plan_name, plan_points in candidates:
-                if points_num >= plan_points:
-                    chosen_plan, chosen_points = plan_name, plan_points
-                    break
+
+            if days_left >= STAGE2_DAYS and points_num >= STAGE2_POINTS:
+                # 阶段二：余粮充足，吃 plan500 的最高汇率
+                chosen_plan, chosen_points = "plan500", 500
+                self._log(
+                    cookie_idx, domain, LogEmoji.EXCHANGE,
+                    f"余粮充足（剩 {days_left} 天），进入收割期，兑换 plan500",
+                )
+            else:
+                # 阶段一：只兑最低档滚动续期
+                if points_num >= 100:
+                    chosen_plan, chosen_points = "plan100", 100
+                    self._log(
+                        cookie_idx, domain, LogEmoji.EXCHANGE,
+                        f"保命期（剩 {days_left} 天），兑换 plan100 滚动续期",
+                    )
 
             if chosen_plan is None:
-                cheapest = min(self.config.EXCHANGE_PLANS.values())
+                need = 500 if days_left >= STAGE2_DAYS else 100
                 self._log(
-                    cookie_idx,
-                    domain,
-                    LogEmoji.EXCHANGE,
-                    f"积分不足（{points_num}/{cheapest}），本次跳过兑换",
+                    cookie_idx, domain, LogEmoji.EXCHANGE,
+                    f"积分不足（{points_num}/{need}），本次跳过兑换",
                 )
-                result.exchange = f"积分不足（{points_num} 分，最低需 {cheapest} 分）"
+                result.exchange = f"积分不足（{points_num} 分，需 {need} 分）"
             else:
-                if chosen_plan != preferred_plan:
-                    self._log(
-                        cookie_idx,
-                        domain,
-                        LogEmoji.EXCHANGE,
-                        f"积分 {points_num} 不够 {preferred_plan}，自动降级为 {chosen_plan}",
-                    )
                 self._log(
-                    cookie_idx,
-                    domain,
-                    LogEmoji.EXCHANGE,
+                    cookie_idx, domain, LogEmoji.EXCHANGE,
                     f"开始兑换 {chosen_plan} (需要 {chosen_points} 积分)",
                 )
                 result.exchange = api.exchange(cookie, chosen_plan, chosen_points)
 
+            # 5. 落盘一条记录，便于日后核对真实积分规律
+            try:
+                self._record_daily(cookie_idx, domain, points_num, days_left, result)
+            except Exception as exc:  # 记账失败绝不影响签到
+                self._log(cookie_idx, domain, LogEmoji.WARNING, f"记录失败：{exc}")
+
         return result
+
+    def _record_daily(self, cookie_idx, domain, points_num, days_left, result) -> None:
+        """把当天的 IQI、得分、剩余天数、积分追加到「签到记录.tsv」。
+
+        IQI（网络质量指数）直接决定 Cable 加分：指数越低分越高。
+        记下来才能看出真实规律，而不是靠猜。
+        """
+        import datetime
+        import pathlib
+
+        iqi_score = ""
+        cable_points = ""
+        try:
+            raw = self.api_get_raw(cookie_idx, "/api/user/iqi")
+            if raw and raw.get("code") == 0:
+                q = raw.get("data", {}).get("quality", {})
+                iqi_score = q.get("score", "")
+        except Exception:
+            pass
+
+        # 用与前端一致的规则反推 Cable 加分
+        try:
+            s = float(iqi_score)
+            cable_points = 8 if s < 80 else 5 if s < 85 else 3 if s < 90 else 2 if s <= 95 else 1
+        except (TypeError, ValueError):
+            pass
+
+        path = pathlib.Path(__file__).resolve().parent / "签到记录.tsv"
+        new_file = not path.exists()
+        with open(path, "a", encoding="utf-8") as fh:
+            if new_file:
+                fh.write("日期\t域名\tIQI\tCable加分\t剩余天数\t总积分\t签到结果\t兑换\n")
+            fh.write(
+                "\t".join(
+                    [
+                        datetime.datetime.now().strftime("%Y-%m-%d"),
+                        str(domain),
+                        str(iqi_score),
+                        str(cable_points),
+                        str(days_left),
+                        str(points_num),
+                        str(result.status),
+                        str(result.exchange),
+                    ]
+                )
+                + "\n"
+            )
+
+    def api_get_raw(self, cookie_idx, path):
+        """按域名直连查询原始 JSON（用于记录 IQI，失败不影响主流程）"""
+        domain = self.config.DOMAINS[cookie_idx - 1] if cookie_idx - 1 < len(self.config.DOMAINS) else "glados.cloud"
+        url = f"https://{domain}{path}"
+        cookies = self.config.cookies_list[cookie_idx - 1]
+        req = urllib.request.Request(url, headers={"Cookie": cookies, "User-Agent": "glados-checkin"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.load(resp)
 
     def get_results(self) -> List[Dict[str, str]]:
         """获取所有结果"""
