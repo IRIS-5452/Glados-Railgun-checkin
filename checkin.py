@@ -1,6 +1,7 @@
 import requests
 import json
 import re
+import sys
 import urllib.request
 import os
 import logging
@@ -9,6 +10,11 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
 from pypushdeer import PushDeer
 from logging_config import init_logger
+
+
+# 账号不在这些域名下，签到失败属于预期，不计入"真失败"。
+# railgun.info 与 glados.cloud 是两个独立站点，本账号只注册了后者。
+IGNORE_FAIL_DOMAINS = {"railgun.info"}
 
 
 class CheckinStatus(Enum):
@@ -623,8 +629,17 @@ class Checker:
 logger = init_logger()
 
 
-def main():
-    """主函数"""
+def main() -> int:
+    """主函数
+
+    返回退出码: 0 = 签到正常, 1 = 存在非预期的失败。
+
+    为什么要返回退出码: 服务端返回 code:-2 (Cookie 失效) 时, 原脚本只打日志、
+    正常退出, workflow 因此一直显示 success (绿色对勾), 而实际签到早就停了
+    —— 2026-09-25 踩过这个坑, 账号静默裸奔了好几天才发现。
+    现在失败会让 workflow 真的变红, GitHub 也会自动发失败通知邮件。
+    """
+    exit_code = 0
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -633,6 +648,7 @@ def main():
         if not config.cookies_list:
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
             title, content = "# 未找到 cookies!", ""
+            exit_code = 1
         else:
             # 2. 执行签到
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
@@ -644,16 +660,36 @@ def main():
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
+            # 3.5 判断是否真的失败(排除已知的预期失败域名)
+            unexpected = [
+                r for r in checker.get_results()
+                if r["code"] == CheckinStatus.FAILURE
+                and r["domain"] not in IGNORE_FAIL_DOMAINS
+            ]
+            if unexpected:
+                exit_code = 1
+                for r in unexpected:
+                    logger.error(
+                        f"{LogEmoji.ERROR} 签到失败: {r['domain']} "
+                        f"—— 大概率是 Cookie 失效了, 需要重新获取"
+                    )
+
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
         title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        exit_code = 1
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
     push_service = PushService(config if "config" in locals() else "")
     push_service.send(title, content)
-    logger.info(f"{LogEmoji.END} 签到完成")
+
+    if exit_code:
+        logger.error(f"{LogEmoji.END} 签到完成, 但存在失败项 (退出码 {exit_code})")
+    else:
+        logger.info(f"{LogEmoji.END} 签到完成")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
