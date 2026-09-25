@@ -43,13 +43,41 @@ jobs:
         pip install requests
         pip install pypushdeer
 
-    # 执行 签到脚本
+    # 执行 签到脚本（失败不中断，留给下一步自动重登）
     - name: Running checkin
+      id: checkin
+      continue-on-error: true
       run: |
         python checkin.py
       env:
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+        GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+        GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+
+    # cookie 失效时自动重新登录（走邮箱验证码，无需人工参与）
+    - name: Auto relogin on failure
+      if: steps.checkin.outcome == 'failure'
+      run: |
+        pip install pynacl
+        python relogin.py
+      env:
+        GMAIL_USER: ${{ secrets.GMAIL_USER }}
+        GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        GH_PAT: ${{ secrets.GH_PAT }}
+
+    # 用刚拿到的新 cookie 重试签到
+    - name: Retry checkin with fresh cookie
+      if: steps.checkin.outcome == 'failure'
+      run: |
+        if [ -f .new_cookie ]; then
+          export GLADOS_COOKIES="$(cat .new_cookie)"
+          echo "使用自动重登拿到的新 cookie 重试"
+        else
+          echo "没有新 cookie，沿用原有 secret 重试"
+        fi
+        python checkin.py
+      env:
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
